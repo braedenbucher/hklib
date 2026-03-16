@@ -5,8 +5,11 @@ Experimental Windows kernel hook library using trampoline detours and atomic 16-
 ## Environment and Workflow
 
 OS: VMWare Workstation Windows 10/11 x64 Virtual Machine
+
 Toolchain: Visual Studio + Windows Driver Kit (WDK)
+
 Driver type: kernel-mode driver
+
 Build using the Visual Studio driver project configuration.
 
 Basic testing was performed in a virtual machine with kernel debugging enabled.
