@@ -33,7 +33,7 @@ HkInitialize();
 // Apply the patch and populate the trampoline
 NTSTATUS status = HkDetourFunction(TargetFunction, MyHookFunction, &trampoline);
 
-// 
+// call the hook
 
 // Restore the patch and free the trampoline
 NTSTATUS status = HkRestoreFunction(trampoline);
@@ -93,15 +93,15 @@ return HK_CALL_ORIGINAL(Trampoline, NtOpenProcess_t)(
 ```
 The caller must still define the correct function typedef so the compiler receives the return type, parameters, and calling convention.
 
-## Utilities / Mechanisms
+## Primary Utilities and Mechanisms
 
-**Length Detection** - Uses an external length disassembler (`ld.c`) to determine the size of instructions at the start of a target function. The detour requires a minimum overwrite size (16 bytes), so instructions are sequentially decoded until enough bytes can safely be replaced without splitting an instruction.
+- Uses an external **Length Disassembler** (`ld.c`) to determine the size of instructions at the start of a target function. The detour requires a minimum overwrite size (16 bytes), so instructions are decoded without splitting.
 
 **Trampoline Construction** - When a hook is installed, the overwritten instructions from the target function are copied into a newly allocated executable buffer. Execution can continue normally by jumping from this relocated block back into the original function after the patched region.
 
 **RIP-Relative Detour Stub** - The hook patch uses an indirect RIP-relative jump (`FF 25 [rip+0]`) followed by an absolute pointer to the hook function. This allows the detour to jump to any 64-bit address without relying on 32-bit relative offsets.
 
-**Atomic 16-Byte Code Patching** - The original function is modified using a 16-byte atomic compare-and-swap via `InterlockedCompareExchange128`. This reduces the chance of partially written instructions being observed by another CPU during patch installation.
+**Atomic 16-Byte Code Patching** - The original function is modified using a 16-byte atomic compare-and-swap via `InterlockedCompareExchange128`. This _reduces_ (not eliminates) the chance of partially written instructions being observed by another CPU during patch installation.
 
 **MDL-Based Writable Code Mapping** - Executable kernel code is typically read-only. The implementation temporarily maps the target memory using an MDL (`Memory Descriptor List`) and adjusts page protection to allow writing before performing the atomic swap.
 
