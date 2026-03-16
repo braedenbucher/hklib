@@ -1,6 +1,6 @@
 # hklib
 
-Experimental Windows kernel hook library using trampoline detours and atomic 16-byte inline patching. Allows authors to initialize trampolines for each detour, and restore them gracefully on driver exit.
+Experimental Windows kernel hook library using trampoline detours. Allows authors to initialize trampolines for each detour, and restore them gracefully on driver exit.
 
 ## Environment and Workflow
 ```
@@ -10,15 +10,16 @@ Driver type: kernel-mode driver
 ```
 _Requires disabling PatchGuard_
 
-Build using the Visual Studio driver project configuration.
+Built using the Visual Studio driver project configuration.
 Basic testing was performed in a virtual machine with kernel debugging enabled.
 1. Build the driver with Visual Studio.
-2. Boot the VM with kernel debugging enabled.
+2. Boot the VM with kernel debugging and test signing enabled.
 3. Load the driver.
 4. Use WinDbg to inspect patched functions and verify trampoline execution.
 5. Manual validation of hook installation and restoration.
 
-Future expansions should include more structured testing. This version is experimental.
+> [!WARNING]
+> This version is experimental. Revisions and additions should include more rigorous testing.
 
 ## Usage
 
@@ -42,14 +43,14 @@ NTSTATUS status = HkReleaseTrampoline(Trampoline);
 HkReleaseAllHooks();
 ```
 Notes on installing and removing hooks:
-- The `HkDetourFunction` API does not perform type checking on the function pointers. For convenience and clarity, the helper macro `HkInstallHook` wraps the detour call and automatically handles the trampoline handle.
-- The library uses a two-phase restore: first `HkRestoreFunction` writes back the original bytes, then `HkReleaseTrampoline` frees the trampoline memory. This ensures that any threads currently executing inside the trampoline are no longer using it before it is freed. For convenience, the `HkRemoveHook` macro combines both steps safely.
+- The `HkDetourFunction` API does not perform type checking on provided pointers. The helper macro `HkInstallHook` wraps the detour and handles the trampoline handle.
+- The library uses a two-phase restore: First `HkRestoreFunction` restores the patch, then `HkReleaseTrampoline` frees the trampoline memory. This is intentional, so that callers can guarantee threads currently executing inside the trampoline have exited before freeing. The helper macro `HkRemoveHook` combines both steps.
 
 When a hook is installed, the trampoline contains:
 - The relocated instructions that were overwritten in the target function
 - A jump back to the original execution flow
 
-This entry point in the field `Trampoline->RelocatedCode` behaves like the original function. You have four options when you want to call the original function from your hook:
+The original function's entry point is in the field `Trampoline->RelocatedCode`, and behaves like the original function. You have four options when you want to call the original function from your hook:
 1. You declare the trampoline handle and cast the `RelocatedCode` pointer to the correct function type manually.
 ```c
 PHK_TRAMPOLINE Trampoline;
@@ -86,7 +87,7 @@ NTSTATUS HookedNtClose(HANDLE Handle) {
 }
 ```
 
-## Primary Utilities and Mechanisms
+## Primary Mechanisms
 
 - Uses an external **Length Disassembler** (`ld.c`) to determine the size of instructions at the start of a target function. The detour requires a minimum overwrite size (16 bytes), so instructions are decoded without splitting.
 - **Trampoline Construction** - On hook installation he overwritten instructions and another relative jump are copied into an executable buffer inside the trampoline. Execution can continue normally by jumping from this relocated block back into the original function after the patched region.
