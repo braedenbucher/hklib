@@ -3,15 +3,14 @@
 Experimental Windows kernel hook library using trampoline detours and atomic 16-byte inline patching. Allows authors to initialize trampolines for each detour, and restore them gracefully on driver exit.
 
 ## Environment and Workflow
-
+```
 OS: VMWare Workstation Windows 10/11 x64 Virtual Machine
-
 Toolchain: Visual Studio + Windows Driver Kit (WDK)
-
 Driver type: kernel-mode driver
+```
+_Requires disabling PatchGuard_
 
 Build using the Visual Studio driver project configuration.
-
 Basic testing was performed in a virtual machine with kernel debugging enabled.
 1. Build the driver with Visual Studio.
 2. Boot the VM with kernel debugging enabled.
@@ -25,73 +24,66 @@ Future expansions should include more structured testing. This version is experi
 
 The library exposes a small API:
 ```c
-PHK_TRAMPOLINE trampoline;
+PHK_TRAMPOLINE Trampoline;
 
 // Initialize the library
 HkInitialize();
 
 // Apply the patch and populate the trampoline
-NTSTATUS status = HkDetourFunction(TargetFunction, MyHookFunction, &trampoline);
+NTSTATUS status = HkDetourFunction(TargetFunction, MyHookFunction, &Trampoline);
 
-// call the hook
+// Hook Logic
 
 // Restore the patch and free the trampoline
-NTSTATUS status = HkRestoreFunction(trampoline);
-NTSTATUS status = HkReleaseTrampoline(trampoline);
+NTSTATUS status = HkRestoreFunction(Trampoline);
+NTSTATUS status = HkReleaseTrampoline(Trampoline);
 
 // Restore and release all active trampolines
 HkReleaseAllHooks();
 ```
+Notes on installing and removing hooks:
+- The `HkDetourFunction` API does not perform type checking on the function pointers. For convenience and clarity, the helper macro `HkInstallHook` wraps the detour call and automatically handles the trampoline handle.
+- The library uses a two-phase restore: first `HkRestoreFunction` writes back the original bytes, then `HkReleaseTrampoline` frees the trampoline memory. This ensures that any threads currently executing inside the trampoline are no longer using it before it is freed. For convenience, the `HkRemoveHook` macro combines both steps safely.
 
-When a hook is installed with `HkDetourFunction`, a trampoline is populated that contains:
+When a hook is installed, the trampoline contains:
 - The relocated instructions that were overwritten in the target function
 - A jump back to the original execution flow
-This entry point in the field `Trampoline->RelocatedCode` behaves like the original function.
-To invoke the original implementation from a hook, cast this pointer to the original function prototype and call it normally.
-
-Example:
+This entry point in the field `Trampoline->RelocatedCode` behaves like the original function. You have four options when you want to call the original function from your hook:
+1. You declare the trampoline handle and cast the `RelocatedCode` pointer to the correct function type manually.
 ```c
-typedef NTSTATUS (*NtOpenProcess_t)(
-    PHANDLE ProcessHandle,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    PCLIENT_ID ClientId
-);
-
 PHK_TRAMPOLINE Trampoline;
+typedef NTSTATUS (*NtClose_t)(HANDLE Handle);
 
-NTSTATUS NtOpenProcessHook(
-    PHANDLE ProcessHandle,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    PCLIENT_ID ClientId
-)
-{
-    NtOpenProcess_t Original =
-        (NtOpenProcess_t) Trampoline->RelocatedCode;
-
-    return Original(
-        ProcessHandle,
-        DesiredAccess,
-        ObjectAttributes,
-        ClientId
-    );
+NTSTATUS HookedNtClose(HANDLE Handle) {
+    NtClose_t Original = (NtClose_t)Trampoline->RelocatedCode;
+    return Original(Handle);
 }
 ```
-A helper macro may be used to simplify the cast:
+2. Use `HK_DECLARE_TRAMPOLINE` to declare the trampoline and `HK_DEFINE_ORIGINAL` to generate a type-safe original function wrapper.
 ```c
-#define HK_CALL_ORIGINAL(trampoline, type) ((type)((trampoline)->RelocatedCode))
+HK_DECLARE_TRAMPOLINE(NtClose)
+HK_DEFINE_ORIGINAL(NtClose, NTSTATUS, HANDLE Handle)
+
+NTSTATUS HookedNtClose(HANDLE Handle) {
+    return NtClose_Original(Handle);
+}
 ```
-Usage:
+3. Use `HK_DECLARE_AND_DEFINE` to declare the trampoline and generate a typed original in one line.
 ```c
-return HK_CALL_ORIGINAL(Trampoline, NtOpenProcess_t)(
-    ProcessHandle,
-    DesiredAccess,
-    ObjectAttributes,
-    ClientId
-);
+HK_DECLARE_AND_DEFINE(NtClose, NTSTATUS, HANDLE Handle)
+
+NTSTATUS HookedNtClose(HANDLE Handle) {
+    return NtClose_Original(Handle);
+}
 ```
-The caller must still define the correct function typedef so the compiler receives the return type, parameters, and calling convention.
+4. Use `HK_CALL_ORIGNAL` for simple casts; requires a typedef for the function type.
+```c
+typedef NTSTATUS (*NtClose_t)(HANDLE Handle);
+
+NTSTATUS HookedNtClose(HANDLE Handle) {
+    return HK_CALL_ORIGINAL(Trampoline, NtClose_t)(Handle);
+}
+```
 
 ## Primary Utilities and Mechanisms
 
