@@ -36,3 +36,31 @@ NTSTATUS HkReleaseTrampoline(_In_ PHK_TRAMPOLINE Trampoline);
 
 _IRQL_requires_max_(APC_LEVEL)
 VOID HkReleaseAllHooks(VOID);
+
+static inline NTSTATUS HkInstallHook(PVOID Target, PVOID Hook, PHK_TRAMPOLINE* OutTrampoline) {
+    return HkDetourFunction(Target, Hook, OutTrampoline);
+}
+
+static inline void HkRemoveHook(PHK_TRAMPOLINE* Trampoline) {
+    if (*Trampoline) {
+        HkRestoreFunction(*Trampoline);
+        HkReleaseTrampoline(*Trampoline);
+        *Trampoline = NULL;
+    }
+}
+
+#define HK_DECLARE_TRAMPOLINE(name) \
+    static PHK_TRAMPOLINE name##Trampoline = NULL
+
+#define HK_DEFINE_ORIGINAL(name, ret_type, ...) \
+    static inline ret_type name##_Original(__VA_ARGS__) { \
+        return ((ret_type(*)(__VA_ARGS__))(name##Trampoline->RelocatedCode))(__VA_ARGS__); \
+    }
+
+#define HK_DECLARE_DEFINE(name, ret_type, ...)           \
+    static PHK_TRAMPOLINE name##Trampoline = NULL;          \
+    static inline ret_type name##_Original(__VA_ARGS__) {    \
+        return ((ret_type(*)(__VA_ARGS__))(name##Trampoline->RelocatedCode))(__VA_ARGS__); \
+    }
+
+#define HK_CALL_ORIGINAL(trampoline, type) ((type)((trampoline)->RelocatedCode))
