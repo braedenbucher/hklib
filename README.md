@@ -48,6 +48,7 @@ Notes on installing and removing hooks:
 When a hook is installed, the trampoline contains:
 - The relocated instructions that were overwritten in the target function
 - A jump back to the original execution flow
+
 This entry point in the field `Trampoline->RelocatedCode` behaves like the original function. You have four options when you want to call the original function from your hook:
 1. You declare the trampoline handle and cast the `RelocatedCode` pointer to the correct function type manually.
 ```c
