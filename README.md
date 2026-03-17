@@ -4,9 +4,9 @@ Experimental Windows kernel hook library using trampoline detours. Allows author
 
 ## Environment
 ```
-OS: VMWare Workstation Windows 10/11 x64 Virtual Machine
-Toolchain: Visual Studio + Windows Driver Kit (WDK)
-Driver type: kernel-mode driver
+VMWare Workstation Windows 10/11 x64 Virtual Machine
+Visual Studio + Windows Driver Kit (WDK)
+Test-signed kernel-mode driver
 ```
 _Requires disabling PatchGuard_
 
