@@ -2,7 +2,7 @@
 
 Experimental Windows kernel hook library using trampoline detours. Allows authors to initialize trampolines for each detour, and restore them gracefully on driver exit.
 
-## Environment and Workflow
+## Environment
 ```
 OS: VMWare Workstation Windows 10/11 x64 Virtual Machine
 Toolchain: Visual Studio + Windows Driver Kit (WDK)
