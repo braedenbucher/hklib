@@ -15,12 +15,30 @@ typedef struct _HK_HOOK_TABLE {
 } HK_HOOK_TABLE;
 static HK_HOOK_TABLE HkpHookTable;
 
+/**
+ * Writes a 14-byte RIP-relative absolute jump instruction at WriteAddress.
+ *
+ * The instruction sequence is:
+ *     FF 25 00 00 00 00
+ *     <8-byte absolute destination>
+ *
+ * The caller must guarantee that WriteAddress points to writable memory
+ * with at least FULL_DETOUR_SIZE bytes available.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 static VOID HkpPlaceRipJump(_In_ PVOID WriteAddress, _In_ PVOID JumpDestination) {
     RtlCopyMemory((PUCHAR)WriteAddress, HkpRipRelativeJump, sizeof(HkpRipRelativeJump));
     RtlCopyMemory((PUCHAR)WriteAddress + sizeof(HkpRipRelativeJump), &JumpDestination, sizeof(PVOID));
 }
 
+/**
+ * Determines the minimum number of bytes to be copied from the
+ * start of TargetFunction for a detour patch of FULL_DETOUR_SIZE bytes.
+ * Does not split any instruction boundaries.
+ *
+ * The function walks instructions using LdeGetInstructionLength until
+ * the accumulated length is >= FULL_DETOUR_SIZE.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS HkpGetMinimumCopyLength(_In_ PVOID FunctionStart, _Out_ SIZE_T* OutLength) {
     PUCHAR ptr = (PUCHAR)FunctionStart;
@@ -39,6 +57,19 @@ static NTSTATUS HkpGetMinimumCopyLength(_In_ PVOID FunctionStart, _Out_ SIZE_T* 
     return STATUS_SUCCESS;
 }
 
+/**
+ * Atomically replaces 16 bytes of executable code at TargetAddress.
+ *
+ * Maps the target page writable via a Memory Descriptor List and performs a
+ * cmpxchg16b operation on the mapped virtual address.
+ *
+ * Requirements:
+ *   - TargetAddress must be 16-byte aligned
+ *   - ATOMIC_PATCH_SIZE must be 16
+ *
+ * The current 16 bytes must match the captured
+ * comparand used by InterlockedCompareExchange128.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS HkpAtomicWriteCode16Bytes(_In_ PVOID TargetAddress, _In_ PUCHAR ReplacementBytes) {
     if ((ULONG64)TargetAddress != ((ULONG64)TargetAddress & ~0xf)) {
@@ -84,6 +115,13 @@ static NTSTATUS HkpAtomicWriteCode16Bytes(_In_ PVOID TargetAddress, _In_ PUCHAR 
     return STATUS_SUCCESS;
 }
 
+/**
+ * Inserts a trampoline entry into the global hook table.
+ *
+ * The table is protected by HkpHookTable.Lock. If the table is full
+ * (HK_MAX_HOOKS entries) the function fails with
+ * STATUS_INSUFFICIENT_RESOURCES.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS HkpRegisterTrampoline(_In_ PHK_TRAMPOLINE Trampoline) {
     KIRQL OldIrql;
@@ -103,12 +141,30 @@ static NTSTATUS HkpRegisterTrampoline(_In_ PHK_TRAMPOLINE Trampoline) {
     return Status;
 }
 
+/**
+* On startup, clears the hook table and initializes the spinlock for that table.
+*/
 _IRQL_requires_max_(APC_LEVEL)
 VOID HkInitialize(VOID) {
     RtlZeroMemory(&HkpHookTable, sizeof(HK_HOOK_TABLE));
     KeInitializeSpinLock(&HkpHookTable.Lock);
 }
 
+/**
+ * Installs a detour hook on TargetFunction.
+ *
+ * Replaces the first 16 bytes of TargetFunction with a RIP-relative
+ * absolute jump to HookFunction. The displaced instructions are
+ * copied to a an executable buffer in the trampoline which allows the
+ * original function to be executed.
+ *
+ * On success:
+ *   - a trampoline object is returned via OutTrampoline
+ *   - the hook becomes active immediately
+ *
+ * The caller must later call HkRestoreFunction followed by
+ * HkReleaseTrampoline to fully remove the hook.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS HkDetourFunction(_In_ PVOID TargetFunction, _In_ PVOID HookFunction, _Out_ PHK_TRAMPOLINE* OutTrampoline) {
     NTSTATUS Status;
@@ -168,6 +224,13 @@ NTSTATUS HkDetourFunction(_In_ PVOID TargetFunction, _In_ PVOID HookFunction, _O
     return Status;
 }
 
+/**
+ * Removes the active detour patch from a function.
+ *
+ * The original 16 bytes saved in the trampoline are written back
+ * also using cmpxchg16b. After a successful restore the trampoline
+ * enters the HK_DRAINING state and may be released.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS HkRestoreFunction(_In_ PHK_TRAMPOLINE Trampoline) {
     if (Trampoline == NULL) {
@@ -185,6 +248,12 @@ NTSTATUS HkRestoreFunction(_In_ PHK_TRAMPOLINE Trampoline) {
     return Status;
 }
 
+/**
+ * Frees a trampoline after the hook has been restored.
+ *
+ * The trampoline must be in HK_DRAINING state. The routine removes the
+ * entry from the global hook table and releases all associated memory.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS HkReleaseTrampoline(_In_ PHK_TRAMPOLINE Trampoline) {
     if (Trampoline == NULL)
@@ -208,6 +277,11 @@ NTSTATUS HkReleaseTrampoline(_In_ PHK_TRAMPOLINE Trampoline) {
     return STATUS_SUCCESS;
 }
 
+/**
+ * Restores and releases every hook currently registered in the
+ * global hook table. A snapshot of the table is taken so hooks
+ * can be safely restored outside the spinlock.
+ */
 _IRQL_requires_max_(APC_LEVEL)
 VOID HkReleaseAllHooks(VOID) {
     PHK_TRAMPOLINE Snapshot[HK_MAX_HOOKS];
