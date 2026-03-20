@@ -21,8 +21,8 @@ static HK_HOOK_TABLE HkpHookTable;
  * The instruction sequence is:
  *     FF 25 00 00 00 00
  *     <8-byte absolute destination>
- *
- * The caller must guarantee that WriteAddress points to writable memory
+ * 
+ * Note: The caller must guarantee that WriteAddress points to writable memory
  * with at least FULL_DETOUR_SIZE bytes available.
  */
 _IRQL_requires_max_(APC_LEVEL)
@@ -59,16 +59,14 @@ static NTSTATUS HkpGetMinimumCopyLength(_In_ PVOID FunctionStart, _Out_ SIZE_T* 
 
 /**
  * Atomically replaces 16 bytes of executable code at TargetAddress.
- *
  * Maps the target page writable via a Memory Descriptor List and performs a
  * cmpxchg16b operation on the mapped virtual address.
  *
- * Requirements:
- *   - TargetAddress must be 16-byte aligned
- *   - ATOMIC_PATCH_SIZE must be 16
- *
- * The current 16 bytes must match the captured
- * comparand used by InterlockedCompareExchange128.
+ * Note: 
+ * - The current 16 bytes must match the captured
+ *   comparand used by InterlockedCompareExchange128.
+ * - TargetAddress must be 16-byte aligned
+ * - ATOMIC_PATCH_SIZE must be 16
  */
 _IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS HkpAtomicWriteCode16Bytes(_In_ PVOID TargetAddress, _In_ PUCHAR ReplacementBytes) {
@@ -118,9 +116,8 @@ static NTSTATUS HkpAtomicWriteCode16Bytes(_In_ PVOID TargetAddress, _In_ PUCHAR 
 /**
  * Inserts a trampoline entry into the global hook table.
  *
- * The table is protected by HkpHookTable.Lock. If the table is full
- * (HK_MAX_HOOKS entries) the function fails with
- * STATUS_INSUFFICIENT_RESOURCES.
+ * Note: The table is protected by HkpHookTable.Lock. If the table is full
+ * (HK_MAX_HOOKS entries) the function fails with STATUS_INSUFFICIENT_RESOURCES.
  */
 _IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS HkpRegisterTrampoline(_In_ PHK_TRAMPOLINE Trampoline) {
@@ -162,7 +159,7 @@ VOID HkInitialize(VOID) {
  *   - a trampoline object is returned via OutTrampoline
  *   - the hook becomes active immediately
  *
- * The caller must later call HkRestoreFunction followed by
+ * Note: The caller must later call HkRestoreFunction followed by
  * HkReleaseTrampoline to fully remove the hook.
  */
 _IRQL_requires_max_(APC_LEVEL)
