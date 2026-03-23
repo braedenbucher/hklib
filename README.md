@@ -1,7 +1,8 @@
 # hklib
 
-Experimental Windows kernel hook library using trampoline detours. Allows authors to initialize trampolines for each detour, and restore them gracefully on driver exit.
+Experimental Windows kernel hook package using trampoline detours. Allows authors to initialize trampolines for each detour, and restore them gracefully on driver exit.
 
+_Modeled by the detour approaches of Minhook and MS Detours._
 ## Environment
 ```
 VMWare Workstation Windows 10/11 x64 Virtual Machine
