@@ -12,13 +12,13 @@ Test-signed kernel-mode driver
 ```
 _Requires disabling PatchGuard_
 
-Built using the Visual Studio driver project configuration.
-Basic testing was performed in a virtual machine with kernel debugging enabled.
+Built using the [Visual Studio](https://visualstudio.microsoft.com/) driver project configuration.
+Basic testing was performed in a [VMWare Workstation](https://knowledge.broadcom.com/external/article/344595/downloading-and-installing-vmware-workst.html) virtual machine with kernel debugging enabled.
 1. Build the driver with Visual Studio.
 2. Boot the VM with kernel debugging and test signing enabled.
 3. Load the driver.
-4. Use WinDbg to inspect patched functions and verify trampoline execution.
-5. Manual validation of hook installation and restoration.
+4. WinDbg trace the patched functions and verify trampoline execution.
+5. Validate hook installation and restoration.
 
 > [!WARNING]
 > This version is experimental. Revisions and additions should include more rigorous testing.
