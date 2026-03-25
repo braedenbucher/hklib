@@ -2,7 +2,7 @@
 
 Experimental Windows kernel hook package using trampoline detours. Allows authors to initialize trampolines for each detour, and restore them gracefully on driver exit.
 
-_Modeled by the detour approaches of Minhook and MS Detours._
+_Modeled by the detour approaches of [Minhook](https://github.com/TsudaKageyu/minhook) and [MS Detours](https://github.com/microsoft/detours)._
 
 ## Environment
 ```
