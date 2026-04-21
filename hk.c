@@ -22,7 +22,7 @@ static HK_HOOK_TABLE HkpHookTable;
  *     FF 25 00 00 00 00
  *     <8-byte absolute destination>
  * 
- * Note: The caller must guarantee that WriteAddress points to writable memory
+ * Note: WriteAddress must point to writable memory
  * with at least FULL_DETOUR_SIZE bytes available.
  */
 _IRQL_requires_max_(APC_LEVEL)
