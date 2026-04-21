@@ -136,6 +136,7 @@ IRQL stands for **Interrupt Request Level**. This is one of the most important c
 | 1    | `APC_LEVEL`      | Asynchronous Procedure Calls, most kernel work |
 | 2    | `DISPATCH_LEVEL` | The thread scheduler, DPC routines             |
 | 3–31 | Device/Clock/IPI | Hardware interrupt handlers                    |
+
 The reason this is critical to our functions: Our functions are manipulating memory at the kernel level. Doing so means we will encounter page faults for memory that needs to be brought into ram. In userspace, when a page fault occurs the kernel's scheduler will interrupt you, suspend your thread, go fetch the page from disk, and resume you. But right now, our code *is* kernel code. What if our functions are running on the same dispatch level as the scheduler itself? The scheduler can't interrupt because you're also at dispatch level, so the system bugchecks with DRIVER_IRQL_NOT_LESS_OR_EQUAL.
 
 In addition, *our trampoline is executable code*. If execution reaches our trampoline, but it's out on disk, fetching the instructions causes a page fault. If that execution is taking place at dispatch or higher, that page fault can't happen and we get bugchecked.
@@ -513,6 +514,7 @@ The core ones you'll see:
 | `_Out_opt_`       | Like `_Out_` but may be NULL                                  |
 | `_In_reads_(n)`   | Pointer to a buffer the function reads, `n` elements long     |
 | `_Out_writes_(n)` | Pointer to a buffer the function writes, `n` elements long    |
+
 In your code, `_Out_ PVOID* OutTrampoline` tells the analyzer that the function is responsible for writing a valid value through that pointer before returning successfully. If there's a code path that returns `STATUS_SUCCESS` without writing to it, the analyzer will flag it.
 
 ## Type Names
@@ -537,6 +539,7 @@ The base types themselves:
 |`SIZE_T`|`size_t`|
 |`BOOLEAN`|`unsigned char` (TRUE/FALSE, not bool)|
 |`NTSTATUS`|`LONG` — a 32-bit status code|
+
 The reason these exist at all is portability across architectures and toolchains going back to the early 90s, before C99 stdint types existed. They also make intent clearer, `NTSTATUS` tells you immediately that a value encodes a kernel status code, even though it's just a `LONG` underneath.
 
 ## NTSTATUS
