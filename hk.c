@@ -105,7 +105,15 @@ static NTSTATUS HkpAtomicWriteCode16Bytes(_In_ PVOID TargetAddress, _In_ PUCHAR 
     AtomicSwapComparand[0] = WritableMappedAddress[0];
     AtomicSwapComparand[1] = WritableMappedAddress[1];
 
-    InterlockedCompareExchange128(WritableMappedAddress, ((PLONG64)ReplacementBytes)[1], ((PLONG64)ReplacementBytes)[0], AtomicSwapComparand);
+    BOOLEAN Exchanged = InterlockedCompareExchange128(WritableMappedAddress, ((PLONG64)ReplacementBytes)[1], ((PLONG64)ReplacementBytes)[0], AtomicSwapComparand);
+
+
+    if (!Exchanged) {
+	    MmUnmapLockedPages(WritableMappedAddress, PageMdl); 
+	    MmUnlockPages(PageMdl);
+	    IoFreeMdl(PageMdl);
+	    return STATUS_DEVICE_BUSY;
+    }
 
     MmUnmapLockedPages(WritableMappedAddress, PageMdl);
     MmUnlockPages(PageMdl);
