@@ -326,7 +326,7 @@ VOID HkReleaseAllHooks(VOID) {
 
 The snapshot drops the lock before calling into either function, giving `HkReleaseTrampoline` a clean acquisition path and ensuring `HkRestoreFunction` is only called once per trampoline. The pointers are safe to dereference after the lock drops because `HkReleaseAllHooks` is the only teardown caller, so nothing else will free them out from under us.
 
-# Macros
+# Wrappers and Macros
 
 Now actually executing this can be verbose. Just hooking `NtOpen` would look like:
 
@@ -352,7 +352,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING	Regi
 }
 ```
 
-We can actually macro a lot of this out.
+I wrote a few inline functions to reduce the verbosity.
 
 ```c
 static inline NTSTATUS HkInstallHook(PVOID Target, PVOID Hook, PHK_TRAMPOLINE* OutTrampoline) {
@@ -366,7 +366,7 @@ static inline void HkRemoveHook(PHK_TRAMPOLINE* Trampoline) {
         *Trampoline = NULL;
     }
 }
-
+// Removed # for writeup syntax highlighting
 define HK_DECLARE_TRAMPOLINE(name) \
     static PHK_TRAMPOLINE name##Trampoline = NULL
 
