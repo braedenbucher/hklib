@@ -1,0 +1,583 @@
+
+A **hook** replaces the entry of a target function with an absolute jump to a user-defined handler. Because this overwrites executable instructions, those bytes are preserved in a trampoline buffer. The trampoline executes the displaced instructions and then resumes execution at the original function past the patched region. This allows the hook to optionally invoke original behavior while maintaining control over execution flow. Restoration reverses this process by atomically restoring the original bytes.
+
+# The Detour
+
+Functions are just consecutive instructions in memory. When a function is called, the instruction pointer (`rip`) is set to the function's entry address and execution begins from there:
+
+```
+0x12 0x34 0x56 0x78 0x90 0x12 0x34 0x56 0x78 0x90 0x12 0x34 0x56 0x78
+ ^
+rip
+```
+
+To intercept execution before any of the original instructions run, the entry point must be overwritten. The goal is to redirect control flow to a hook located elsewhere in memory, which requires replacing the first instruction(s) with a jump. More precisely, a **64-bit absolute jump instruction**.
+
+x64 only encodes jump offsets as 32-bit values, so a direct `jmp imm64` doesn't exist as an instruction. Instead, an indirect jump is used. This indirect jump is written as `jmp qword ptr [rip+0]`. This is a 6-byte instruction, which reads the 8 bytes immediately after it, interprets them as a 64-bit address, and jumps to it.
+
+```c
+static const UCHAR HkpRipRelativeJump[] = {
+	0xff, 0x25, 0x00, 0x00, 0x00, 0x00
+};
+```
+
+So this is what we will patch into the function, 6 bytes + 8 bytes address = 14 bytes:
+
+```
+		Absolute jmp                         Address
+|---------------------------|----------------------------------------|
+0xff 0x25 0x00 0x00 0x00 0x00 0x34 0x56 0x78 0x90 0x12 0x34 0x56 0x78
+ ^
+rip
+```
+
+This introduces a problem: the original instructions at the function entry are overwritten. Because execution is now redirected, the overwritten instructions must be preserved if the original behavior is to remain callable.
+
+But while our hook is in place, we might want to still call the original function. Copying *exactly* 14 bytes risks splitting instructions.
+
+*\[] represents a complete instruction*
+```
+  1    2    3    4
+[0x12 0x34 0x56 0x78]
+  5    6    7    8    9    10   11
+[0x90 0x12 0x34 0x56 0x78 0x90 0x12]
+  12   13   14   15   16
+[0x34 0x56 0x78 0x90 0x12]
+. . .
+```
+
+In the example above, if we place our jmp+addr in, we break the third instruction:
+
+*Original function*
+```
+  1    2    3    4    5    6    7    8    9    10   11   12   13   14
+[0xff 0x25 0x00 0x00 0x00 0x00 0x34 0x56 0x78 0x90 0x12 0x34 0x56 0x78]
+0x90 0x12
+ 15   16 <- !! partial 3rd instruction !!
+```
+
+*Stored copy*
+```
+[0x12 0x34 0x56 0x78]                 <- complete instruction
+[0x90 0x12 0x34 0x56 0x78 0x90 0x12]  <- complete instruction
+[0x34 0x56 0x78                       <- !! incomplete instruction !!
+```
+
+Executing the copied bytes would be invalid, because the final instruction is incomplete. Therefore, the copy must be *at least 14 bytes*, and *end on an instruction boundary (i.e. store only complete instructions)*.
+
+This means execution can begin with the relocated instructions and then continue at the original function past the patched region.
+
+# The Trampoline
+
+As mentioned, the original function can no longer be entered at its original entry point. A new entry path must be constructed for the original function. This replacement entry is called the **trampoline**.
+
+It's a synthetic sequence of instructions that reproduces the original function's entry behavior then resumes execution at the correct location inside the original function.
+
+The trampoline consists of two parts:
+1. The complete set of instructions overwritten by the detour *(extended to preserve instruction boundaries)*
+2. Another absolute jump back to the original function *after* the overwritten region.
+
+When the hook needs to invoke the original behavior, it executes the trampoline. Execution begins with the relocated instructions and then continues in the original function. The goal of the trampoline is to restore what the detour disrupts. The detour redirects execution to the hook; the trampoline redirects it back to the original function.
+
+*Original after overwrite*
+```
+  1    2    3    4    5    6    7    8    9    10   11   12   13   14
+[0xff 0x25 0x00 0x00 0x00 0x00 0x34 0x56 0x78 0x90 0x12 0x34 0x56 0x78
+0x90 0x12] <--  execution resumes after overwritten region
+ 15   16
+```
+
+*Trampoline*
+```
+[0x12 . . . 0x12]               <-- original before overwrite
+[0xff 0x25 0x00 0x00 0x00 0x00] <-- absolute jmp
+[addr of byte 17]
+```
+*The jump targets the address immediately after the overwritten region, since the trampoline has already executed those instructions.*
+
+Although execution spans multiple memory regions, the trampoline preserves instruction order and prevents control flow from terminating at the patched entry. Without the trampoline, the original function cannot be executed correctly once its entry point has been overwritten. 
+
+# Writing to Kernel Code
+
+Our goal is to write our detour to kernel functions. But all we have is a single address to the function. Not only that, it's a virtual address using a mapping to actually write to the physical frame. Kernel code pages are intentionally mapped read-only as a security measure at the PTE level, meaning the restriction belongs to the mapping itself and not the underlying physical frame. 
+
+That virtual mapping also comes with another problem: the page in RAM might be moved or swapped while we try to write to it.
+
+This gives us two jobs our current virtual address mapping can't be used for:
+1. We need to modify the same underlying pages through a separate virtual address with different permissions.
+2. We need the underlying pages to *stay in ram* while we modify them.
+
+The mechanism that allows us to do both tasks is an **Memory Descriptor List (MDL)**. It's simply a descriptor tied to a virtual address range that, once populated, holds an array of its corresponding Physical Frame Numbers. This physical description is what allows us and the kernel to guarantee a safe write. The MDL is the required interface that makes these operations possible.
+
+The first step is *probing and locking the pages*. This is an operation on an MDL which:
+1. Verifies that the underlying physical pages are in RAM.
+2. Pins the underlying pages in RAM so they cannot be swapped out.
+3. Populates the MDL with those underlying pages.
+
+The kernel can then use the MDL to construct a second virtual address mapping describing the same underlying physical frames, only with different protections. 
+
+Performing the write through this new mapping modifies the physical page without permission faults. Since both virtual addresses ultimately translate to the same physical bytes in RAM, there is only one copy of the data, so the change is immediately visible through the original mapping.
+
+# 16-byte Atomic Write
+
+The detour we are writing is at least 14 bytes in length. But assembly level writes using `mov` can only copy up to *8 bytes at the maximum*, thus we would need *two* writes to move the entire jump and address buffer. This is a critical problem since any inspection between those two steps would observe partially written state, so we need a single atomic instruction to perform the write.
+
+`InterlockedCompareExchange128` compiles down to `cmpxchg16b`, a single instruction that atomically reads, compares, and conditionally writes 16 bytes. It loads the destination into `RDX:RAX`, compares it against an comparand also held in `RDX:RAX`, and if they match, writes the new value from `RCX:RBX` to the destination in one uninterruptible operation. No other core can observe the memory between the read and the write.
+
+For our purposes the comparison is just a formality. We know exactly what bytes are there because we just went through a whole process of preserving them. So we will fill our comparand with that prior content to guarantee the comparison passes, then use our detour as the replacement.
+
+# IRQL
+
+IRQL stands for **Interrupt Request Level**. This is one of the most important concepts in Windows kernel programming and has no real equivalent in usermode C. CPU cores themselves hold a value in a register called the IRQL which says "these interrupts will halt you, these will be masked". Interrupts themselves are associated with an IRQL, so interrupts at the level of the core or below are masked. If you have code running at 2, a keyboard interrupt from 1 cannot halt you, a procedure call from 2 cannot halt you, but a clock interrupt from 30 can. A level just means "interrupts from this level disrupt all below".
+
+| IRQL | Name             | What runs here                                 |
+| ---- | ---------------- | ---------------------------------------------- |
+| 0    | `PASSIVE_LEVEL`  | Normal usermode and most kernel code           |
+| 1    | `APC_LEVEL`      | Asynchronous Procedure Calls, most kernel work |
+| 2    | `DISPATCH_LEVEL` | The thread scheduler, DPC routines             |
+| 3–31 | Device/Clock/IPI | Hardware interrupt handlers                    |
+The reason this is critical to our functions: Our functions are manipulating memory at the kernel level. Doing so means we will encounter page faults for memory that needs to be brought into ram. In userspace, when a page fault occurs the kernel's scheduler will interrupt you, suspend your thread, go fetch the page from disk, and resume you. But right now, our code *is* kernel code. What if our functions are running on the same dispatch level as the scheduler itself? The scheduler can't interrupt because you're also at dispatch level, so the system bugchecks with DRIVER_IRQL_NOT_LESS_OR_EQUAL.
+
+In addition, *our trampoline is executable code*. If execution reaches our trampoline, but it's out on disk, fetching the instructions causes a page fault. If that execution is taking place at dispatch or higher, that page fault can't happen and we get bugchecked.
+
+`_IRQL_requires_max_(APC_LEVEL)` is a SAL annotation telling the analyzer (and the reader) that this function must not be called at `DISPATCH_LEVEL` or higher. Trying to call it would bug check (`DRIVER_IRQL_NOT_LESS_OR_EQUAL`) at runtime. We apply this to every function we will write below.
+
+# The Detour Function
+
+## Setup
+
+*Macros at the top of the file*
+```c
+static const UCHAR HkpRipRelativeJump[] =
+	{0xff, 0x25, 0x00, 0x00, 0x00, 0x00};
+
+define FULL_DETOUR_SIZE   (sizeof(HkpRipRelativeJump) + sizeof(PVOID))
+define ATOMIC_PATCH_SIZE  (16ul)
+define HK_POOL_TAG        ('kHkH')
+```
+
+- `FULL_DETOUR_SIZE` is the length of our absolute jump, 14 bytes
+- `ATOMIC_PATCH_SIZE` is for `cmpxchg16b`, will always be 16 bytes
+- `HK_POOL_TAG` will be elaborated below, this is used for the region allocated for the trampoline
+
+*The function's signature*
+```c
+NTSTATUS HkDetourFunction(
+	_In_ PVOID TargetFunction,
+	_In_ PVOID HookFunction,
+	_In_ SIZE_T CopiedCodeLength,
+	_Out_ PVOID* OutTrampoline
+)
+```
+
+- `TargetFunction` is the address of our target
+- `HookFunction` is the address of our hook
+- `CopiedCodeLength` is the number of bytes to the instruction boundary. As mentioned earlier, we need to store the first instructions >= 14 bytes. This is the exact number of bytes we will need to store.
+*How will it know how many bytes to write to cover instruction boundaries? This typically requires a disassembler library (like Zydis or hde64) to walk instructions and find the right boundary.*
+- `OutTrampoline` is the address of the trampoline's preserved instructions for returning to the original function
+
+*Commented lines are to reduce contrast of simple checks.*
+
+```c
+// if (OutTrampoline == NULL) { return STATUS_INVALID_PARAMETER_4; }
+
+if (CopiedCodeLength < FULL_DETOUR_SIZE) {
+	return STATUS_INVALID_PARAMETER_3;
+}
+```
+
+We first do a standard check for the trampoline pointer. Next, we make sure that the length of the complete instructions we are preserving is larger than the size of our detour. This is so that the trampoline's callable region needs to fully cover the overwritten bytes so executing it doesn't run into a partial instruction.
+
+## Building the Trampoline
+
+```c
+PUCHAR TrampolinePoolBase = ExAllocatePool2(
+		POOL_FLAG_NON_PAGED,
+		ATOMIC_PATCH_SIZE + CopiedCodeLength + FULL_DETOUR_SIZE,
+		HK_POOL_TAG
+);
+
+// if (TrampolinePoolBase == NULL) {
+//     return STATUS_INSUFFICIENT_RESOURCES;
+// }
+```
+
+To create our trampoline, we will use `ExAllocatePool2`. This is the Windows kernel `malloc`. There are three things going on here:
+1. The `POOL_FLAG_NON_PAGED` is to avoid the exact IRQL issue we discussed earlier. We don't want this executable code being paged out to disk, then code at `DISPATCH_LEVEL` trying to swap it to RAM. So this assures the page isn't ever swapped to disk.
+2. The size breaks down into three fields:
+	1. `ATOMIC_PATCH_BYTES` is 16 bytes long. Since the `cmpxchg16b` needs 16 bytes, we will actually store a copy of the first 16 bytes of the function. This is NOT the same as storing the instructions. This is so that when we restore the swapped bytes, we have a copy in memory to reference from.
+	   
+	2. `CopiedCodeLength` is for the first component of the trampoline discussed earlier: the first instructions >=  14 bytes up to a boundary.
+	   
+	3. `FULL_DETOUR_SIZE` is for the second component of the trampoline discussed earlier: the absolute jump back to the original.
+	   
+3. `HK_POOL_TAG` is a WDK convention. Kernel pool allocations are tagged with a 4-byte identifier (stored in reverse byte order, so this appears as `HkHk` in tools like WinDbg or poolmon) to help track memory leaks and identify allocations by driver.
+
+It's important to note that the `OutTrampoline` pointer is pointing to *field 2*, whichs is the *first component* our overview mentioned. We are adding a new "first field" purely for restoration, the "new second field" contains the executables, therefore our hook needs the pointer on field 2 while the detour is in place.
+
+*2-Field Trampoline Layout from earlier*
+```
+[0x12 0x34 . . . 0x90 0x12 0x34]          <- entry instruction bytes
+[0xff 0x25 0x00 0x00 0x00 0x00]           <- 6 bytes absolute jmp
+[0x19 0x28 0x37 0x46 0x55 0x64 0x73 0x82] <- 8 byte address to target
+```
+
+*3-field Trampoline Layout*
+```
+[0x12 0x34 . . . 0x78 0x90]               <- 16 bytes from target
+[0x12 0x34 . . . 0x90 0x12 0x34]          <- CopiedCodeLength bytes
+[0xff 0x25 0x00 0x00 0x00 0x00]           <- 6 bytes absolute jmp
+[0x19 0x28 0x37 0x46 0x55 0x64 0x73 0x82] <- 8 byte address to target
+```
+
+We conclude with a simple check the allocation was successful.
+
+```c
+RtlCopyMemory(
+	TrampolinePoolBase, // dest
+	TargetFunction,     // src
+	ATOMIC_PATCH_SIZE   // size
+);
+
+RtlCopyMemory(
+	TrampolinePoolBase + ATOMIC_PATCH_SIZE,
+	TargetFunction,
+	CopiedCodeLength
+);
+
+HkpPlaceRipJump(
+	TrampolinePoolBase + ATOMIC_PATCH_SIZE + CopiedCodeLength,
+	(PVOID)((ULONG_PTR)TargetFunction + CopiedCodeLength)
+);
+```
+
+Next, we fill out the three fields of the trampoline in order. For this, `RrlCopyMemory` is essentially `memcpy`.
+
+- The first line copies 16 bytes from the target function into the start of the trampoline buffer.
+- The second line copies `CopiedCodeLength` bytes from the target function into the trampoline just after the first field.
+- The third line fills out the third field by placing the absolute jump bytes and the address of the original function just after the instructions, all using the helper below.
+
+## Absolute Jump Helper Function
+
+```c
+static VOID HkpPlaceRipJump(
+	_In_ PVOID WriteAddress,
+	_In_ PVOID JumpDestination
+) {
+	RtlCopyMemory(
+		(PUCHAR)WriteAddress,
+		HkpRipRelativeJump,
+		sizeof(HkpRipRelativeJump)
+	);
+	RtlCopyMemory(
+		(PUCHAR)WriteAddress + sizeof(HkpRipRelativeJump),
+		&JumpDestination,
+		sizeof(PVOID)
+	);
+}
+```
+
+- `WriteAddress` is the location where you want to write the jump instruction
+- `JumpDestination` is the location the jump will direct to
+
+Both fields are simply written consecutively at the write address just as formatted earlier.
+
+## Building the Detour patch
+
+```c
+UCHAR DetourPatch[ATOMIC_PATCH_SIZE];
+HkpPlaceRipJump(DetourPatch, HookFunction);
+RtlCopyMemory(
+	(PUCHAR)DetourPatch + FULL_DETOUR_SIZE,
+	(PUCHAR)TargetFunction + FULL_DETOUR_SIZE,
+	ATOMIC_PATCH_SIZE - FULL_DETOUR_SIZE
+);
+```
+
+To build our patch, we will fill out the 16 byte buffer used for the exchange. The first portion is just like the trampoline, we will place the rip jump into the buffer using our helper method.
+
+Next, since we are writing 16 bytes to the location, but our detour is only 14 bytes, we manually put the 2 bytes between them into the buffer. That way, only the 14 bytes are changing, even if the write swaps out 16.
+
+## Writing the Bytes
+
+```c
+NTSTATUS Status = HkpAtomicWriteCode16Bytes(
+	TargetFunction,
+	DetourPatch
+);
+
+if (!NT_SUCCESS(Status)) {
+	ExFreePoolWithTag(TrampolinePoolBase, HK_POOL_TAG);
+} else {
+	*OutTrampoline = TrampolinePoolBase + ATOMIC_PATCH_SIZE;
+}
+return Status;
+```
+
+Now, we actually write the bytes. We'll construct a method to do the MDL manipulation in the below section, and just call it from here. We'll return an `NTSTATUS` to check success, and if it fails we'll just free the memory.
+
+If successful, our detour is in place and the provided trampoline buffer is filled and ready to be executed.
+
+# The Write Function
+
+## Setup
+
+```c
+static NTSTATUS HkpAtomicWriteCode16Bytes(
+	_In_ PVOID TargetAddress,
+	_In_ PUCHAR ReplacementBytes
+)
+```
+
+- `TargetAddress` is the location we will write to, for our purposes it is the address of the target function's entry instructions
+- `ReplacementBytes` is the buffer we will place, in our case it is the 16 bytes containing our absolute jmp + 2 bytes of original code
+
+```c
+if ((ULONG64)TargetAddress != ((ULONG64)TargetAddress & ~0xf)) {
+	return STATUS_DATATYPE_MISALIGNMENT;
+}
+```
+
+First we check the 16-byte alignment. `~0xf` is a bitmask that zeroes out the bottom 4 bits. If the address is already aligned those bits were zero anyway, so the value doesn't change. If they weren't zero the check fails. This is a hard requirement of the `cmpxchg16b` CPU instruction we're about to use.
+
+## Building the Virtual Address
+
+```c
+PMDL PageMdl = IoAllocateMdl(
+	TargetAddress,
+	ATOMIC_PATCH_SIZE,
+	FALSE,
+	FALSE,
+	NULL
+);
+// if (PageMdl == NULL) { return STATUS_INSUFFICIENT_RESOURCES; }
+// __try {
+	MmProbeAndLockPages(PageMdl, KernelMode, IoReadAccess);
+// } __except (EXCEPTION_EXECUTE_HANDLER) {
+// 	IoFreeMdl(PageMdl);
+//	return STATUS_INVALID_ADDRESS;
+//}
+```
+
+- `IoAllocateMdl` creates the MDL for the target function's address. Its size is constrained to `ATOMIC_PATCH_SIZE` since that is the length of bytes we are writing.
+- `MmProbeAndLockPages` validates the underlying physical pages are in RAM, pins them to avoid paging out, and populates the MDL with them.
+  
+We finish this by running a check on the allocation as well as catching any exceptions with the probe/lock that may occur. Cleanup as needed.
+
+```c
+PLONG64 WritableMappedAddress = MmMapLockedPagesSpecifyCache(
+	PageMdl,
+	KernelMode,
+	MmNonCached,
+	NULL,
+	FALSE,
+	NormalPagePriority | MdlMappingNoExecute
+);
+// if (WritableMappedAddress == NULL) {
+//     MmUnlockPages(PageMdl);
+//     IoFreeMdl(PageMdl);
+//     return STATUS_INTERNAL_ERROR;
+// }
+
+NTSTATUS Status = MmProtectMdlSystemAddress(PageMdl, PAGE_READWRITE);
+// if (!NT_SUCCESS(Status)) {
+//     MmUnmapLockedPages(WritableMappedAddress, PageMdl);
+//     MmUnlockPages(PageMdl);
+//     IoFreeMdl(PageMdl);
+//     return Status;
+// }
+```
+
+- `MmMapLockedPagesSpecifyCache` generates the alternate virtual address to the target's physical pages using the MDL we just created.
+	- `MmNonCached`: The CPU caches memory accesses in L1/L2/L3 to avoid hitting RAM on every read. If the new mapping and the original use different cache behavior, a write through one might not be immediately visible through the other. `MmNonCached` bypasses the cache entirely for this mapping, going straight to physical RAM, so the write is immediately visible through both virtual addresses.
+	  
+	- `NormalPagePriority`: Controls how hard the memory manager tries to create the mapping under memory pressure. `NormalPagePriority` is the standard choice: create the mapping normally, and return NULL if resources are too scarce. Higher priorities exist but are reserved for more critical operations.
+	  
+	- `MdlMappingNoExecute`: Marks the new mapping as non-executable at the PTE level. Since this mapping exists purely to write bytes, there is no reason it should ever be executed. If control flow somehow reached it, the CPU would fault rather than execute whatever bytes happen to be there. Some versions of Windows enforce this regardless, so it's also future-proofing against stricter kernel policy.
+	  
+- `MmProtectedMdlSystemAddress` modifies the permissions of the MDL we created so writes to the virtual address generated from it are allowed.
+We also run basic success checks on the operations above, cleaning up on failure.
+
+## Placing the Detour
+
+```c
+LONG64 AtomicSwapComparand[2];
+AtomicSwapComparand[0] = WritableMappedAddress[0];
+AtomicSwapComparand[1] = WritableMappedAddress[1];
+
+InterlockedCompareExchange128(
+	WritableMappedAddress,
+	((PLONG64)ReplacementBytes)[1],
+	((PLONG64)ReplacementBytes)[0],
+	AtomicSwapComparand
+);
+```
+
+Now we write to the address. Since `InterlockedCompareExchange128` and it's counterpart `cmpxchg16b` requires a comparand (even though it's redundant here), we create a small buffer with the original bytes of the function to guarantee a pass
+
+Then, we execute the write instruction on our virtual address, placing in the detour passed to this function.
+
+Just a note, even though the write is atomic, if two threads simultaneously install, then one will silently fail the CAS race but return SUCCESS. Since the function returns `1` on success and `0` on failure, we'll check that, and just return a separate value.
+
+```c
+BOOLEAN Exchanged = InterlockedCompareExchange128( 
+	WritableMappedAddress,
+	((PLONG64)ReplacementBytes)[1],
+	((PLONG64)ReplacementBytes)[0],
+	AtomicSwapComparand
+);
+
+if (!Exchanged) {
+	MmUnmapLockedPages(WritableMappedAddress, PageMdl); 
+	MmUnlockPages(PageMdl);
+	IoFreeMdl(PageMdl);
+	return STATUS_DEVICE_BUSY;
+}
+```
+
+Lastly, we clean up by unlocking the page, freeing the MDL, and returning success.
+
+```c
+MmUnmapLockedPages(WritableMappedAddress, PageMdl);
+MmUnlockPages(PageMdl);
+IoFreeMdl(PageMdl);
+return STATUS_SUCCESS;
+```
+
+# The Restore Function
+
+## Setup
+
+```c
+NTSTATUS HkRestoreFunction(
+	_In_ PVOID HookedFunction,
+	_In_ PVOID OriginalTrampoline
+)
+```
+- `HookedFunction` is the function we are restoring
+- `OriginalTrampoline` is the trampoline buffer containing the preserved bytes
+
+## Restoring the Entry
+
+```c
+PUCHAR TrampolinePoolBase =
+	(PUCHAR)OriginalTrampoline - ATOMIC_PATCH_SIZE;
+
+NTSTATUS Status = HkpAtomicWriteCode16Bytes
+	HookedFunction,
+	TrampolinePoolBase
+);
+```
+
+To start, our `OriginalTrampoline` pointed to the complete instructions needed to execute. But that was the *second* field of the trampoline, the first was the preserved 16 bytes we now need to put back. So we make a new pointer to point to the first field.
+
+Next, we just use `HkpAtomicWriteCode16Bytes` to re-write the target function's entry point, this time placing the original 16 bytes back over the detour.
+
+## Thread Safety Delay
+
+```c
+LARGE_INTEGER DelayInterval;
+DelayInterval.QuadPart = -100000;
+KeDelayExecutionThread(KernelMode, FALSE, &DelayInterval);
+
+// ExFreePoolWithTag(TrampolinePoolBase, HK_POOL_TAG);
+```
+
+`KeDelayExecutionThread` is just kernel `Sleep`. The negative value is the WDK convention for relative time in 100-nanosecond intervals, so -100000 is 10 milliseconds. 
+
+The moment `HkpReplaceCode16Bytes` returns, the original function is restored, but another thread that could be mid-execution *inside* the trampoline is still running. That thread doesn't know the trampoline is being torn down. If you free the memory immediately, that thread is now executing freed memory, which is undefined behavior at best and a bugcheck at worst.
+
+The 10ms sleep is just a bet. We're wagering that no thread will spend more than 10ms inside the trampoline. It's not guaranteed by anything, just usually true for short hook trampolines. It's the kind of shortcut that works fine in practice until one day it doesn't.  In practice most production kernel hooking code either uses reference counting or just accepts the sleep as a reasonable tradeoff, since the window of danger is genuinely tiny.
+
+Safer approaches would be:
+- **Reference counting** each time a thread enters the trampoline, and decrementing when it leaves. The teardown waits until the counter hits zero before freeing. This is exact rather than a time guess, but it requires modifying the trampoline code itself to do the counting, which gets complicated.
+- **CPU synchronization**, which issue an Inter-Processor Interrupt (IPI) to every other CPU core, forcing them to a known safe point before you free anything. This is essentially what some production hooking frameworks do. It's expensive but precise.
+- **Epoch-based reclamation**, a technique from lock-free data structures where threads periodically announce what "epoch" they're in, and memory is only freed once all threads have advanced past the epoch where the trampoline was live. Complex to implement but very safe.
+In practice most production kernel hooking code either uses reference counting or just accepts the sleep as a reasonable tradeoff, since the window of danger is genuinely tiny.
+
+Lastly, we just free the trampoline pointer we used for the write.
+
+# Windows conventions
+
+## SAL Annotations
+SAL stands for **Source Annotation Language**. It's a Microsoft-specific set of macros that annotate function parameters and return values with their intended semantics. They exist purely for static analysis tools (PREfast, `/analyze` in MSVC) to catch bugs.
+
+The core ones you'll see:
+
+| Annotation        | Meaning                                                       |
+| ----------------- | ------------------------------------------------------------- |
+| `_In_`            | Caller provides this, function only reads it                  |
+| `_Out_`           | Function writes to this, caller doesn't need to initialize it |
+| `_Inout_`         | Caller initializes it, function may modify it                 |
+| `_In_opt_`        | Like `_In_` but may be NULL                                   |
+| `_Out_opt_`       | Like `_Out_` but may be NULL                                  |
+| `_In_reads_(n)`   | Pointer to a buffer the function reads, `n` elements long     |
+| `_Out_writes_(n)` | Pointer to a buffer the function writes, `n` elements long    |
+In your code, `_Out_ PVOID* OutTrampoline` tells the analyzer that the function is responsible for writing a valid value through that pointer before returning successfully. If there's a code path that returns `STATUS_SUCCESS` without writing to it, the analyzer will flag it.
+
+## Type Names
+Windows defines its own type aliases in `<ntdef.h>` and `<basetsd.h>` (both pulled in via `<ntddk.h>`). The naming follows a consistent pattern:
+
+The `P` prefix means pointer-to:
+- `PVOID` = `void*`
+- `PUCHAR` = `unsigned char*`
+- `PLONG64` = `int64_t*`
+- `PMDL` = `MDL*`
+
+The base types themselves:
+
+|Windows type|C equivalent|
+|---|---|
+|`VOID`|`void`|
+|`UCHAR`|`unsigned char`|
+|`ULONG`|`unsigned long` (32-bit)|
+|`ULONG64`|`unsigned __int64`|
+|`ULONG_PTR`|pointer-sized unsigned int (32 or 64-bit)|
+|`LONG64`|`__int64`|
+|`SIZE_T`|`size_t`|
+|`BOOLEAN`|`unsigned char` (TRUE/FALSE, not bool)|
+|`NTSTATUS`|`LONG` — a 32-bit status code|
+The reason these exist at all is portability across architectures and toolchains going back to the early 90s, before C99 stdint types existed. They also make intent clearer, `NTSTATUS` tells you immediately that a value encodes a kernel status code, even though it's just a `LONG` underneath.
+
+## NTSTATUS
+`NTSTATUS` values encode a lot of information in their bits such as severity, facility, and a code, but in practice you check them with macros:
+
+- `NT_SUCCESS(status)`: true if the operation succeeded (status ≥ 0)
+- `NT_ERROR(status)`: true if it's a hard error
+- `NT_WARNING(status)`:  true for warnings
+
+The constants like `STATUS_SUCCESS`, `STATUS_INSUFFICIENT_RESOURCES`, `STATUS_INVALID_PARAMETER_3` are all predefined in `<ntstatus.h>`. The numbered parameter variants (`_3`, `_4`) tell the caller exactly which argument was bad without needing a separate error message.
+
+## Exception Handling
+This is Microsoft's extension to C for structured exception handling (SEH). It's not standard C and predates C++ exceptions. In kernel code it's used specifically to catch hardware exceptions that would otherwise crash the system.
+
+```c
+__try {
+    MmProbeAndLockPages(Mdl, KernelMode, IoReadAccess);
+} __except (EXCEPTION_EXECUTE_HANDLER) {
+    // runs if MmProbeAndLockPages raises an exception
+}
+```
+
+`EXCEPTION_EXECUTE_HANDLER` is a filter expression meaning "catch everything and run the handler." You can also pass an expression that evaluates the exception code and decides whether to handle it. In kernel code, `__try/__except` is used much more conservatively than in usermode, wrapping only calls that can legitimately fault on bad input pointers.
+
+## Large Integers and Time values
+`LARGE_INTEGER` is a union that gives you a 64-bit integer either as `.QuadPart` (the whole thing), or `.LowPart`/`.HighPart` separately. It predates widespread 64-bit integer support.
+
+The delay value in `HkRestoreFunction`:
+
+```c
+SafetyDrainDelay.QuadPart = -100000;
+```
+
+The sign and unit are both meaningful here. Kernel time functions take time in **100-nanosecond intervals**, and the sign encodes the reference point:
+
+- **Negative** = relative time ("from now")
+- **Positive** = absolute time (since Jan 1, 1601 — Windows epoch)
+
+So `-100000` means "10 milliseconds from now" (100,000 × 100ns = 10ms).
+
+## Calling Conventions and VOID return
+You may notice some functions return `VOID` rather than `void`. They're identical: `VOID` is just `#define VOID void`. The Windows headers use it for consistency with their type naming style. Similarly, function signatures in WDK code often use the uppercase versions throughout even where it's not strictly necessary.
+
+One thing that might look odd from standard C: the forward declarations at the top of the header. Because the `.h` file contains both declarations _and_ definitions (it's a single-file implementation header), the definitions appear after the static helpers they call, so the forward declarations at the top ensure the public signatures are visible immediately when the header is included.
