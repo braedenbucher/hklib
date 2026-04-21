@@ -36,7 +36,7 @@ static VOID HkpPlaceRipJump(_In_ PVOID WriteAddress, _In_ PVOID JumpDestination)
  * start of TargetFunction for a detour patch of FULL_DETOUR_SIZE bytes.
  * Does not split any instruction boundaries.
  *
- * The function walks instructions using LdeGetInstructionLength until
+ * Walks instructions using LdeGetInstructionLength until
  * the accumulated length is >= FULL_DETOUR_SIZE.
  */
 _IRQL_requires_max_(APC_LEVEL)
@@ -65,7 +65,7 @@ static NTSTATUS HkpGetMinimumCopyLength(_In_ PVOID FunctionStart, _Out_ SIZE_T* 
  * Note: 
  * - The current 16 bytes must match the captured
  *   comparand used by InterlockedCompareExchange128.
- * - TargetAddress must be 16-byte aligned
+ * - TargetAddress must be 16 byte aligned
  * - ATOMIC_PATCH_SIZE must be 16
  */
 _IRQL_requires_max_(APC_LEVEL)
@@ -117,7 +117,7 @@ static NTSTATUS HkpAtomicWriteCode16Bytes(_In_ PVOID TargetAddress, _In_ PUCHAR 
  * Inserts a trampoline entry into the global hook table.
  *
  * Note: The table is protected by HkpHookTable.Lock. If the table is full
- * (HK_MAX_HOOKS entries) the function fails with STATUS_INSUFFICIENT_RESOURCES.
+ * (HK_MAX_HOOKS entries), this fails with STATUS_INSUFFICIENT_RESOURCES.
  */
 _IRQL_requires_max_(APC_LEVEL)
 static NTSTATUS HkpRegisterTrampoline(_In_ PHK_TRAMPOLINE Trampoline) {
@@ -152,15 +152,12 @@ VOID HkInitialize(VOID) {
  *
  * Replaces the first 16 bytes of TargetFunction with a RIP-relative
  * absolute jump to HookFunction. The displaced instructions are
- * copied to a an executable buffer in the trampoline which allows the
- * original function to be executed.
+ * copied to the executable buffer HK_TRAMPOLINE.RelocatedCode which
+ * allows the original function to be executed.
  *
  * On success:
  *   - a trampoline object is returned via OutTrampoline
  *   - the hook becomes active immediately
- *
- * Note: The caller must later call HkRestoreFunction followed by
- * HkReleaseTrampoline to fully remove the hook.
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS HkDetourFunction(_In_ PVOID TargetFunction, _In_ PVOID HookFunction, _Out_ PHK_TRAMPOLINE* OutTrampoline) {
@@ -224,9 +221,9 @@ NTSTATUS HkDetourFunction(_In_ PVOID TargetFunction, _In_ PVOID HookFunction, _O
 /**
  * Removes the active detour patch from a function.
  *
- * The original 16 bytes saved in the trampoline are written back
- * also using cmpxchg16b. After a successful restore the trampoline
- * enters the HK_DRAINING state and may be released.
+ * The original 16 bytes saved in HK_TRAMPOLINE.OriginalBytes are
+ * written back also using cmpxchg16b. After a successful restore 
+ * the trampoline enters the HK_DRAINING state for release.
  */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS HkRestoreFunction(_In_ PHK_TRAMPOLINE Trampoline) {
