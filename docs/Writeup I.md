@@ -1,4 +1,4 @@
-
+# Overview
 A **hook** replaces the entry of a target function with an absolute jump to a user-defined handler. Because this overwrites executable instructions, those bytes are preserved in a trampoline buffer. The trampoline executes the displaced instructions and then resumes execution at the original function past the patched region. This allows the hook to optionally invoke original behavior while maintaining control over execution flow. Restoration reverses this process by atomically restoring the original bytes.
 
 # The Detour
