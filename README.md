@@ -2,7 +2,7 @@
 
 Experimental Windows kernel hook package using trampoline detours. Allows authors to initialize trampolines for each detour, and restore them gracefully on driver exit.
 
-_Modeled by the detour approaches of [Minhook](https://github.com/TsudaKageyu/minhook) and [MS Detours](https://github.com/microsoft/detours), written from scratch for leaning purposes. For a comprehensive writeup of the internals and my learning process, see the [docs](/docs)._
+_Modeled by the detour approaches of [Minhook](https://github.com/TsudaKageyu/minhook) and [MS Detours](https://github.com/microsoft/detours), written from scratch for learning purposes. For a comprehensive writeup of the internals and my learning process, see the [docs](/docs)._
 
 ## Environment
 ```
@@ -47,6 +47,7 @@ HkReleaseAllHooks();
 Notes on installing and removing hooks:
 - The `HkDetourFunction` API does not perform type checking on provided pointers. The helper macro `HkInstallHook` wraps the detour and handles the trampoline handle.
 - The library uses a two-phase restore: First `HkRestoreFunction` restores the patch, then `HkReleaseTrampoline` frees the trampoline memory. This is intentional, so that callers can guarantee threads currently executing inside the trampoline have exited before freeing. The helper macro `HkRemoveHook` combines both steps.
+- All hooks are registered into a global hook table. This is not deliberately exposed, but exists as `HK_HOOK_TABLE`. On driver exit, calling `HkReleaseAllHook` safely restores and releases every hook in the table.
 
 When a hook is installed, the trampoline contains:
 - The relocated instructions that were overwritten in the target function
@@ -89,31 +90,33 @@ NTSTATUS HookedNtClose(HANDLE Handle) {
 }
 ```
 
-## Primary Mechanisms
+## Mechanisms
 
-- Uses an external **Length Disassembler** (`ld.c`) to determine the size of instructions at the start of a target function. The detour requires a minimum overwrite size (16 bytes), so instructions are decoded without splitting.
-- **Trampoline Construction** - On hook installation he overwritten instructions and another relative jump are copied into an executable buffer inside the trampoline. Execution can continue normally by jumping from this relocated block back into the original function after the patched region.
-- The hook patch uses a **RIP-Relative Detour Stub** consisting of a jump instruction (`FF 25 [rip+0]`) followed by an absolute pointer to the hook. This is a standard detour technique to  jump to any 64-bit address without relying on 32-bit relative offsets.
-- **Atomic 16-Byte Code Patching** - The original function is modified using a 16-byte atomic compare-and-swap via `InterlockedCompareExchange128`. This _reduces_ (not eliminates) the chance of partially written instructions being observed by another CPU during patch installation.
-- Executable kernel code is typically read-only. This implementation uses an **MDL-Based Writable Mapping** to allow read-only physical memory to be modified. A separate virtual page generated from an MDL (`Memory Descriptor List`) adjusts page protection to allow writing before patching.
-- Installed hooks have are tracked in a **Global Hook Table** protected by a spinlock. Each hook transitions through a simple lifecycle:
+- Uses an external length fisassembler (`ld.c`) to determine the size of instructions at the start of a target function. The detour requires a minimum overwrite size (16 bytes), so instructions are decoded without splitting.
+- On hook installation the overwritten instructions and another relative jump are copied into an executable buffer inside a trampoline. Execution can continue normally by jumping from this relocated block back into the original function after the patched region.
+- The hook patch uses a rip-relative detour stub consisting of a jump instruction (`FF 25 [rip+0]`) followed by an absolute pointer to the hook. This is a standard detour technique to  jump to any 64-bit address without relying on 32-bit relative offsets.
+- To atomically patch in the instructions, the original function is modified using a 16-byte atomic compare-and-swap via `InterlockedCompareExchange128`. This _reduces_ (not eliminates) the chance of partially written instructions being observed by another CPU during patch installation.
+- Executable kernel code is typically read-only. This implementation uses an MDL-Based writable mapping to allow read-only physical memory to be modified. A separate virtual page generated from an MDL (`Memory Descriptor List`) changes the page protection to allow writing before patching.
+- Installed hooks have are tracked in a global hook table (protected by a spinlock). Each hook transitions through a simple lifecycle:
     - `HK_INACTIVE` – trampoline allocated but not installed
     - `HK_ACTIVE` – detour installed and operational
     - `HK_DRAINING` – hook removed and awaiting cleanup
-- **Restoration and cleanup** - The original function bytes are stored when the hook is installed.
-    - `HkRestoreFunction` atomically restores these bytes, removing the detour while leaving the trampoline structure intact for cleanup.
-    - `HkReleaseAllHooks` enumerates active hooks, restores the original code, and releases trampoline memory. This provides a basic mechanism for driver unload or emergency cleanup.
+- Uninstalling a trampoline is broken into two phases:
+    - `HkRestoreFunction` atomically restores the original function bytes (stored on installation), removing the detour while leaving the trampoline structure intact for cleanup.
+    - `HkReleaseTrampline` releases all memory associated with the trampoline (primarily the executable buffer and itself)
 
 ## Limitations
 
 
-- **No RIP-Relative Instruction Relocation** - Instructions copied into the trampoline are not rewritten if they reference memory relative to the instruction pointer. If the relocated instructions contain RIP-relative addressing, the displacement will point to an incorrect location when executed from the trampoline.
-- **No Relative Branch Rewriting** - Relative branches (such as `call`, `jmp`, or conditional jumps) inside the relocated instruction block are copied exactly. If such instructions target addresses outside the relocated block, execution may behave incorrectly.
-- The atomic patch routine enforces a **16-byte Alignment Requirement**. This library rejects functions not aligned, since they cannot be hooked without modifying the patch strategy.
-- **No Thread Synchronization During Patching** - The implementation does not pause or synchronize other processors while patching executable code. While the write itself is atomic, another thread executing the function at the same time could theoretically observe inconsistent control flow.
-- The disassembler is also experimental. Instruction decoding determines semi-accurate instruction length for many instructions, but does not account for the entire x86 instruction set. The decoder is not used to analyze semantics or relocation. This is a planned future update for the project.
+- Instructions copied into the trampoline are not rewritten if they reference memory relative to the instruction pointer. If the relocated instructions contain RIP-relative addressing, the displacement may point to an incorrect location when executed from the trampoline.
+- Relative branches (such as `call`, `jmp`, or conditional jumps) inside the relocated instruction block are copied exactly. If such instructions target addresses outside the relocated block, execution may behave incorrectly.
+- The atomic patch routine enforces a 16-byte alignment requirement. Misaligned functions are simply rejected, since they cannot be hooked without modifying the patch method.
+- The implementation does not pause or synchronize other processors while patching the jump stub. While the write itself is atomic, another thread executing the function at the same time could observe inconsistent states prior or after the write.
+- The disassembler is from scratch, and generally experimental. Instruction decoding determines semi-accurate instruction length for _many_ instructions, but does not account for the entire x86 instruction set. The decoder is not used to analyze semantics or relocation. This is a planned future update for the project.
 
-This library also contains many test states such as a fixed size table and small trampoline metadata, as they were unecessary or out-of-scope. Future updates can implement dynamic resizing, duplicate detection, or a more advanced hook state machine. Additionally, this implementation was tested manually in a virutal environment using debugging tools. It has not been stress tested under concurrency or multiple kernel versions.
+This library also contains many test states such as a fixed size table and small trampoline metadata, as they were unecessary or out-of-scope. For a more in-depth breakdown on the capabilities and limitations, see the [docs](/docs) for writeups that follow my thought process and the implementation.
+
+Future updates can implement dynamic resizing, duplicate detection, or a more advanced hook state machine. To reiterate: This implementation was tested manually in a virutal environment using debugging tools. It has not been stress tested under concurrency or multiple kernel versions.
 
 ## License
 
