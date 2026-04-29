@@ -10,7 +10,7 @@ As covered extensively in the inline hook, the trampoline requires multiple inst
 
 # Design
 
-We will start with a pointer to an instruction, and for each component simply walk the bytes. Now, the various prefix and opcode bytes and the immediate/displacement bytes are potentially far apart in the instruction stream. By the time you get to measuring the immediate, you've already consumed the opcode and possibly ModRM and SIB bytes. To handle this, we will stash `OperandSizeOverride`, `RexW` etc. at parsing time so that later stages can reference the conditionals without having to look backwards.
+We will start with a pointer to an instruction, and for each component simply walk the bytes. Now, the various prefix and opcode bytes and the immediate/displacement bytes are potentially far apart in the instruction stream. By the time we get to measuring the immediate, we've already consumed the opcode and possibly ModRM and SIB bytes. To handle this, we will stash `OperandSizeOverride`, `RexW` etc. at parsing time so that later stages can reference the conditionals without having to look backwards.
 
 There are two approaches we could use to store persistent information:
 1. A global `struct` using bits as flags for length summing. Our parser would comb through, and set the flags as needed. This would leave a simple `if-else` structure for the final sum step. Each bit indicates whether a modification is active, and our final "tally" references it for counting.
@@ -32,7 +32,7 @@ typedef struct _OPCODE_INFO {
 
 A lookup table of `_OPCODE_INFO` structs would make the main decode logic easy to read. Instead of a 200-line switch statement you'd just do `info = opcodeTable[opcode]` and then a few `if` checks. Easier to read and extend.
 
-The challenge is one we will break down in depth later. Parsing some special instructions and storing their attributes requires knowing information that comes *after* your current place in the byte stream. You can't really encode values that "may show up later" in a struct without overhead, and would need to come up with some `if/switch` logic to store and reference it later. Therefore, you would likely end up with a hybrid `struct/switch` anyways, and at that point it's subjective whether it's truly "cleaner" than just switch cases.
+The challenge is one we will break down in depth later. Parsing some special instructions and storing their attributes requires knowing information that comes *after* the current place in the byte stream. You can't really encode values that "may show up later" in a struct without overhead, and would need to come up with some `if/switch` logic to store and reference it later. Therefore, you would likely end up with a hybrid `struct/switch` anyways, and at that point it's subjective whether it's truly "cleaner" than just switch cases.
 
 For a proof-of-concept disassembler built for an experimental hook, the lookup table approach doesn't offer a clean separation, and we would likely end up with a hybrid `struct/switch` regardless. The `switch-case` method is good enough for our purposes.
 
@@ -107,7 +107,7 @@ These are just escape bytes, and are *included* in the byte count:
 - **2-byte:** Byte 1 =  `0x0F`, next byte is included in opcode
 - **3-byte:** Byte 1 = `0x0F`, Byte 2 = `0x38` / `0x3A`, next byte is included in opcode
 
-Once you know the instruciton, you ask two questions:
+Once we know the instruciton, we ask two questions:
 1. Does it have a ModRM byte?
 2. Does it have an immediate?
 	- How big is the immediate?
@@ -209,9 +209,9 @@ At the end of this (last comment), the pointer `p` is at the start of the ModRM 
 ```
 
 ## Reg
-In most cases, `reg`  is the easiest field to handle. It's just a register number. But remember Opcode Groups? It's where this field comes into play. Intel repurposed these 3 bits as a **sub-opcode**. For example `0xF6` alone doesn't tell you the instruction, `0xF6` + `reg=0` means TEST, `0xF6` + `reg=2` means NOT, `0xF6` + `reg=3` means NEG, and so on.
+In most cases, `reg`  is the easiest field to handle. It's just a register number. But remember Opcode Groups? It's where this field comes into play. Intel repurposed these 3 bits as a **sub-opcode**. For example `0xF6` alone doesn't tell us the instruction, `0xF6` + `reg=0` means TEST, `0xF6` + `reg=2` means NOT, `0xF6` + `reg=3` means NEG, and so on.
 
-That's why Group 3 (`0xF6`/`0xF7`) is special. The immediate is only present when the sub-opcode is TEST (`reg=0` or `reg=1`). So we have to peek at the ModRM byte before you can know the full length. To do this, we build the conditional from the previous section:
+That's why Group 3 (`0xF6`/`0xF7`) is special. The immediate is only present when the sub-opcode is TEST (`reg=0` or `reg=1`). So we have to peek at the ModRM byte before we can know the full length. To do this, we build the conditional from the previous section:
 
 *Completing the Group 3 case opened in the Opcode section*
 ```c
@@ -228,7 +228,7 @@ if ((opcode == 0xF6 || opcode == 0xF7) && hasModRM) {
 
 We take the ModRM byte, shift right 3 to remove `rm`, and mask all the above bits with `0b00000111` to discard `mod` bits. This isolates `reg`.
 
-`0xF6` is the byte-operand variant of the group, so its TEST always takes a 1-byte immediate. `0xF7` is the word/dword/qword variant, so its immediate size depends on the operand size you resolved from the prefixes earlier, 2 bytes if `0x66` was set, otherwise 4. Note it caps at 4 even for 64-bit, immediates are never 8 bytes except for the special `MOV reg, imm64` encoding.
+`0xF6` is the byte-operand variant of the group, so its TEST always takes a 1-byte immediate. `0xF7` is the word/dword/qword variant, so its immediate size depends on the operand size we resolved from the prefixes earlier, 2 bytes if `0x66` was set, otherwise 4. Note it caps at 4 even for 64-bit, immediates are never 8 bytes except for the special `MOV reg, imm64` encoding.
 
 ## Mod & RM
 These two describe the other operand, and it determines what follows. The `mod` field has four possible values:
@@ -261,6 +261,7 @@ It's always exactly 1 byte, with one special case: If `base = 101` and `mod = 00
 | 01  | 1 byte                  |
 | 10  | 4 bytes                 |
 | 11  | 0 bytes                 |
+
 Just a note, displacement is always signed. 1-byte displacement `0xFF` is `-1`, not 255. This doesn't affect length, just handy to know.
 
 ## Implementation
